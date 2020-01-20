@@ -30,6 +30,8 @@ const {
 //  }
 //});
 
+const queryDebouncer = {};
+
 export default DS.RESTAdapter.extend({
   fixDeleteBug: true,
   coalesceFindRequests: false,
@@ -153,7 +155,7 @@ export default DS.RESTAdapter.extend({
   willDestroy: function() {
     this._stopChangesListener();
   },
-  
+
   _indexPromises: [],
 
   _init: function (store, type) {
@@ -207,7 +209,7 @@ export default DS.RESTAdapter.extend({
       if (relModel) {
         let includeRel = true;
         if (!('options' in rel)) rel.options = {};
-        
+
         if (typeof(rel.options.async) === "undefined") {
           rel.options.async = config.emberPouch && !Ember.isEmpty(config.emberPouch.async) ? config.emberPouch.async : true;//default true from https://github.com/emberjs/data/pull/3366
         }
@@ -216,7 +218,7 @@ export default DS.RESTAdapter.extend({
           let inverse = type.inverseFor(rel.key, store);
           if (inverse) {
             if (inverse.kind === 'belongsTo') {
-              self._indexPromises.push(self.get('db').createIndex({index: { fields: ['data.' + inverse.name, '_id'] }}));
+              //self._indexPromises.push(self.get('db').createIndex({index: { fields: ['data.' + inverse.name, '_id'] }}));
               if (options.async) {
                 includeRel = false;
               } else {
@@ -340,18 +342,80 @@ export default DS.RESTAdapter.extend({
   findAll: function(store, type /*, sinceToken */) {
     // TODO: use sinceToken
     this._init(store, type);
-    return this.get('db').rel.find(this.getRecordTypeName(type));
+    let typeName = this.getRecordTypeName(type);
+    let plural = pluralize(typeName);
+    return this.get('db').allDocs({include_docs: true, startkey: `${typeName}_2_`, endkey: `${typeName}_2_\ufff0`}).then(docs => {
+      let out = {};
+      out[plural] = docs.rows.filter(row => {
+        return row.doc._id.startsWith(typeName);
+      }).map(row => {
+        row.doc.data.id = row.doc._id.replace(`${typeName}_2_`, '');
+        row.doc.data.rev = row.doc._rev;
+        return row.doc.data;
+      });
+      return out;
+    });
+    //
   },
 
   findMany: function(store, type, ids) {
     this._init(store, type);
-    return this.get('db').rel.find(this.getRecordTypeName(type), ids);
+    let typeName = this.getRecordTypeName(type);
+    let plural = pluralize(typeName);
+    return this.get('db').allDocs({include_docs: true}).then(docs => {
+      let out = {};
+      debugger;
+      out[plural] = docs.rows.filter(row => {
+        return row.doc._id.startsWith(typeName);
+      }).map(row => {
+        row.doc.data.id = row.doc._id.replace(`${typeName}_2_`, '');
+        row.doc.data.rev = row.doc._rev;
+        return row.doc.data;
+      }).filter(row => {
+        debugger;
+      });
+      return out;
+    });
   },
 
   findHasMany: function(store, record, link, rel) {
     let inverse = record.type.inverseFor(rel.key, store);
     if (inverse && inverse.kind === 'belongsTo') {
-      return this.get('db').rel.findHasMany(camelize(rel.type), inverse.name, record.id);
+      if(rel.type in queryDebouncer) {
+        return queryDebouncer[rel.type].then(docs => {
+          delete queryDebouncer[rel.type];
+          let out = {};
+          out[rel.key] = docs.rows.filter(row => {
+            return row['doc']['data'][inverse.name] === record.id;
+          }).map(row => {
+            row.doc.data.id = row.doc._id.replace(`${rel.type}_2_`, '');
+            row.doc.data.rev = row.doc._rev;
+            return row.doc.data;
+          });
+          return out;
+        });
+      }
+
+      let query = this.get('db').allDocs({
+        startkey: `${rel.type}_2_`,
+        endkey: `${rel.type}_2_\ufff0`,
+        include_docs: true
+      });
+
+      let ret = query.then(docs => {
+        delete queryDebouncer[rel.type];
+        let out = {};
+        out[rel.key] = docs.rows.filter(row => {
+          return row['doc']['data'][inverse.name] === record.id;
+        }).map(row => {
+          row.doc.data.id = row.doc._id.replace(`${rel.type}_2_`, '');
+          row.doc.data.rev = row.doc._rev;
+          return row.doc.data;
+        });
+        return out;
+      });
+      queryDebouncer[rel.type] = query;
+      return ret;
     } else {
       let result = {};
       result[pluralize(rel.type)] = [];
@@ -381,10 +445,36 @@ export default DS.RESTAdapter.extend({
       queryParams.skip = query.skip;
     }
 
-    return db.find(queryParams).then(pouchRes => db.rel.parseRelDocs(recordTypeName, pouchRes.docs));
+    let typeName = this.getRecordTypeName(type);
+    let plural = pluralize(typeName);
+    return this.get('db').allDocs({include_docs: true, startkey: `${typeName}_1_`, endkey: `${typeName}_3_`}).then(docs => {
+      let out = {};
+      out[plural] = docs.rows.filter(row => {
+        return row.doc._id.startsWith(typeName);
+      }).map(row => {
+        row.doc.data.id = row.doc._id.replace(`${typeName}_2_`, '');
+        row.doc.data.rev = row.doc._rev;
+        return row.doc.data;
+      }).filter(row => {
+        let ret = true;
+        Object.keys(query.filter).forEach(key => {
+          if(key.indexOf("_id") !== -1) {
+            let mod = key.replace("_id", "");
+            if(row[mod] !== query.filter[key]) {
+              ret = false;
+            }
+          } else {
+            debugger;
+          }
+        });
+        return ret;
+      });
+      return out;
+    });
   },
 
   queryRecord: function(store, type, query) {
+    debugger;
     return this.query(store, type, query).then(results => {
       let recordType = this.getRecordTypeName(type);
       let recordTypePlural = pluralize(recordType);
@@ -406,13 +496,27 @@ export default DS.RESTAdapter.extend({
    * for deprecated methods.
   */
   find: function (store, type, id) {
+    debugger;
     return this.findRecord(store, type, id);
   },
 
   findRecord: function (store, type, id) {
     this._init(store, type);
+
     var recordTypeName = this.getRecordTypeName(type);
-    return this._findRecord(recordTypeName, id);
+    return this.get('db').allDocs({
+      include_docs: true,
+      startkey: `${recordTypeName}_2_${id}`,
+      endkey: `${recordTypeName}_2_${id}`,
+      inclusive_end: true
+    }).then(docs => {
+      let row = docs.rows[0];
+      row.doc.data.id = row.doc._id.replace(`${recordTypeName}_2_`, '');
+      row.doc.data.rev = row.doc._rev;
+      let out = {};
+      out[pluralize(recordTypeName)] = [row.doc.data];
+      return out;
+    });
   },
 
   _findRecord(recordTypeName, id) {
@@ -469,13 +573,13 @@ export default DS.RESTAdapter.extend({
     this._init(store, type);
     var data = this._recordToData(store, type, record);
     let rel = this.get('db').rel;
-    
+
     let id = data.id;
     if (!id) {
       id = data.id = rel.uuid();
     }
     this.createdRecords[id] = true;
-    
+
     return rel.save(this.getRecordTypeName(type), data).catch((e) => {
       delete this.createdRecords[id];
       throw e;
